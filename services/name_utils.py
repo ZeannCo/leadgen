@@ -1,0 +1,264 @@
+from __future__ import annotations
+
+import re
+
+_GENERATIONAL_SUFFIXES: frozenset[str] = frozenset({"jr", "sr", "ii", "iii", "iv"})
+
+_OCCUPANT_TRAILER_RE = re.compile(
+    r"[,\s]+("
+    r"and(?:/or)?\s+all\s+(?:other\s+)?occupants?"
+    r"|all\s+(?:other\s+)?occupants?"
+    r"|et\s*\.?\s*al\s*\.?"
+    r")"
+    r"(?:\s+of\s+.*)?"          # also drop "of <address>" tail
+    r".*$",                       # and any tokens after the trailer
+    flags=re.IGNORECASE,
+)
+
+_PLACEHOLDER_NAMES = frozenset({
+    "john doe", "jane doe", "j doe", "jdoe",
+    "unknown", "unknown tenant", "tenant", "tenant in possession",
+    "all occupants", "occupants", "occupants unknown",
+    "squaters", "squatter", "squatters",
+})
+
+
+def clean_tenant_name(raw: str) -> str:
+    """Strip occupant trailers and reject placeholder defendant names.
+
+    Returns the cleaned name, or '' if the row is a placeholder
+    (causes downstream bad_name gate to drop the filing).
+    """
+    if not raw:
+        return ""
+    cleaned = _OCCUPANT_TRAILER_RE.sub("", raw).strip(" ,.")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    if not cleaned:
+        return ""
+    if cleaned.lower() in _PLACEHOLDER_NAMES:
+        return ""
+    return cleaned
+
+
+_BUSINESS_RE = re.compile(
+    r"\b(LLC|INC|CORP|LTD|LP|LLP|PLLC|PROPERTIES|PROPERTY|MANAGEMENT|MGMT|"
+    r"REALTY|INVESTMENTS|HOLDINGS|TRUST|PARTNERS|GROUP|ENTERPRISES|VENTURES|"
+    r"ESTATE\s+OF|DBA|C/O|S\.A\.|BANK)\b",
+    re.IGNORECASE,
+)
+
+_COMMERCIAL_NOTICE_RE = re.compile(r"\b(commercial|retail|office)\b", re.IGNORECASE)
+
+
+def is_business_name(raw: str | None) -> bool:
+    """True when a party name is an entity rather than a natural person.
+
+    Used to keep paid person-lookups off LLCs, banks, and title trusts — they
+    never resolve to a person and every attempt is wasted spend.
+    """
+    return bool(raw) and bool(_BUSINESS_RE.search(raw))
+
+
+def infer_property_type(filing) -> str:
+    """Return 'commercial' or 'residential' from notice_type + tenant_name signals.
+
+    Replaces the per-filing BatchData lookup_property_info call for tenant-only mode.
+    """
+    if _COMMERCIAL_NOTICE_RE.search(filing.notice_type or ""):
+        return "commercial"
+    if _BUSINESS_RE.search(filing.tenant_name or ""):
+        return "commercial"
+    return "residential"
+
+
+def _is_middle_initial(token: str) -> bool:
+    """Single letter or single letter followed by a period."""
+    t = token.rstrip(".")
+    return len(t) == 1
+
+
+_PARTICLE_TOKENS: frozenset[str] = frozenset({
+    "de", "del", "la", "los", "las", "van", "von", "der", "da", "di", "dos",
+})
+
+
+def _is_particle(token: str) -> bool:
+    return token.rstrip(".").lower() in _PARTICLE_TOKENS
+
+
+def parse_name(raw: str) -> tuple[str, str]:
+    """Parse a raw court name into (first_name, last_name).
+
+    Handles:
+    - "LAST, FIRST"
+    - "LAST, FIRST MIDDLE"  -> middle stripped
+    - "FIRST LAST"
+    - "FIRST MIDDLE LAST"   -> middle stripped
+    - "FIRST [MIDDLE] LAST JR/SR/II/III/IV"  -> suffix stripped
+    - "FIRST PARTICLE [PARTICLE] LAST" -> particle(s) kept with last name
+      (e.g. "Stephanie De Los Santos" -> ("Stephanie", "De Los Santos"))
+    """
+    raw = raw.strip()
+    if not raw:
+        return "", ""
+
+    if "," in raw:
+        # "LAST, FIRST [MIDDLE...]"
+        last, _, rest = raw.partition(",")
+        last = last.strip()
+        parts = rest.strip().split()
+        first = parts[0] if parts else ""
+        return (first, last) if first and last else ("", "")
+
+    # Space-separated: "FIRST [MIDDLE] LAST [SUFFIX]" or "FIRST LAST"
+    tokens = raw.split()
+    if len(tokens) < 2:
+        return "", ""
+
+    first = tokens[0]
+    remaining = list(tokens[1:])
+
+    # Strip trailing generational suffixes (Jr, Sr, II, III, IV)
+    while remaining and remaining[-1].rstrip(".").lower() in _GENERATIONAL_SUFFIXES:
+        remaining.pop()
+
+    if not remaining:
+        return "", ""
+
+    # Walk backward from the final token to find where the surname begins.
+    # If the token before the current start is a particle (De / La / Van / ...),
+    # include it in the last name. This keeps compound surnames intact:
+    # "Stephanie De Los Santos" -> last="De Los Santos".
+    last_start = len(remaining) - 1
+    while last_start > 0 and _is_particle(remaining[last_start - 1]):
+        last_start -= 1
+
+    last = " ".join(remaining[last_start:])
+    return first, last
+
+
+# Foreclosure-industry entity names. The shared `is_business_name` catches
+# LLC/INC/TRUST but not the parties that actually appear on recorded default
+# documents — trustees, servicers and title companies:
+#   "FIRST AMERICAN TITLE INSURANCE COMPANY", "QUALITY LOAN SERVICE
+#   CORPORATION", "NATIONAL DEFAULT SERVICING CORPORATION", "TRUSTEE CORPS".
+# All were observed live 2026-08-05. Each one that slips through becomes a
+# paid person-search that can never match a human.
+_FORECLOSURE_ENTITY_RE = re.compile(
+    r"\b(CORPORATION|CORPS?|COMPANY|SERVICING|SERVICES?|TITLE|INSURANCE|"
+    r"TRUSTEE|TRUSTEES|MORTGAGE|LOAN|LENDING|FINANCIAL|ESCROW|BANCORP|"
+    r"SAVINGS|ASSOCIATION|CREDIT\s+UNION|CAPITAL|FUNDING|REO|N\.?A\.?)\b",
+    re.IGNORECASE,
+)
+
+
+def is_entity_name(raw: str | None) -> bool:
+    """True for any non-person party on a foreclosure document."""
+    return bool(raw) and (
+        bool(_BUSINESS_RE.search(raw)) or bool(_FORECLOSURE_ENTITY_RE.search(raw))
+    )
+
+
+def parse_surname_first_name(raw: str) -> tuple[str, str]:
+    """Parse a surname-first, comma-less name into (first_name, last_name).
+
+    County *recorder* indexes store parties this way — the Riverside portal's
+    own help text says "Individual Names should be entered Last First MI (i.e.
+    Smith James M)". Feeding those to `parse_name`, which assumes
+    "FIRST MIDDLE LAST", silently swaps first and last:
+    "MAXON BRUCE ETHAN III" would come back ("MAXON", "ETHAN") instead of
+    ("BRUCE", "MAXON"), and every downstream person lookup would miss.
+
+    Leading particles are kept with the surname, since here they lead:
+    "DE LA TORRE JUAN" -> ("JUAN", "DE LA TORRE").
+    """
+    tokens = (raw or "").strip().split()
+    while tokens and tokens[-1].rstrip(".").lower() in _GENERATIONAL_SUFFIXES:
+        tokens.pop()
+    if len(tokens) < 2:
+        return "", ""
+
+    # Absorb leading particles into the surname, but never consume the last
+    # remaining token — something has to be the first name.
+    idx = 0
+    while idx < len(tokens) - 2 and _is_particle(tokens[idx]):
+        idx += 1
+
+    last = " ".join(tokens[: idx + 1])
+    rest = tokens[idx + 1:]
+    first = rest[0] if rest else ""
+    return (first, last) if first and last else ("", "")
+
+
+def format_display_name(raw: str | None) -> str | None:
+    """Normalize a raw court/import name to a uniform "First Last" display
+    string, regardless of whether the source stored "LAST, FIRST",
+    "LAST FIRST", or "FIRST LAST". Falls back to the original (whitespace-
+    trimmed) string when parse_name can't confidently split it (e.g. a
+    single-token name), so nothing is ever blanked out on the strength of
+    this normalization alone.
+    """
+    if not raw:
+        return raw
+    raw = raw.strip()
+    first, last = parse_name(raw)
+    if not (first and last):
+        return raw
+    return f"{first.strip().title()} {last.strip().title()}"
+
+
+def split_tenants(raw: str) -> list[str]:
+    """Split a multi-tenant string into individual name strings.
+
+    Only splits 4-token strings where no token looks like a middle initial
+    (single character or single char + dot). All other strings returned as-is.
+
+    Examples:
+        "AVONTE THOMAS ASHANTE JOHNSON" -> ["AVONTE THOMAS", "ASHANTE JOHNSON"]
+        "BRETT L LILLY"                 -> ["BRETT L LILLY"]
+    """
+    tokens = raw.strip().split()
+    if len(tokens) == 4 and not any(_is_middle_initial(t) for t in tokens):
+        return [" ".join(tokens[:2]), " ".join(tokens[2:])]
+    return [raw]
+
+
+# Top-300 US Census 2010 surnames (lower-cased). Common names produce
+# multi-match SearchBug responses we'd pay for but reject. Skip them.
+_COMMON_SURNAMES: frozenset[str] = frozenset({
+    "smith", "johnson", "williams", "brown", "jones", "garcia", "miller",
+    "davis", "rodriguez", "martinez", "hernandez", "lopez", "gonzalez",
+    "wilson", "anderson", "thomas", "taylor", "moore", "jackson", "martin",
+    "lee", "perez", "thompson", "white", "harris", "sanchez", "clark",
+    "ramirez", "lewis", "robinson", "walker", "young", "allen", "king",
+    "wright", "scott", "torres", "nguyen", "hill", "flores", "green",
+    "adams", "nelson", "baker", "hall", "rivera", "campbell", "mitchell",
+    "carter", "roberts", "gomez", "phillips", "evans", "turner", "diaz",
+    "parker", "cruz", "edwards", "collins", "reyes", "stewart", "morris",
+    "morales", "murphy", "cook", "rogers", "gutierrez", "ortiz", "morgan",
+    "cooper", "peterson", "bailey", "reed", "kelly", "howard", "ramos",
+    "kim", "cox", "ward", "richardson", "watson", "brooks", "chavez",
+    "wood", "james", "bennett", "gray", "mendoza", "ruiz", "hughes",
+    "price", "alvarez", "castillo", "sanders", "patel", "myers", "long",
+    "ross", "foster", "jimenez", "owens", "weaver", "graves",
+    "washington", "butler", "simmons", "gonzales", "bryant",
+    "alexander", "russell", "griffin", "hayes", "ford",
+    "hamilton", "graham", "sullivan", "wallace", "woods", "cole", "west",
+    "jordan", "reynolds", "fisher", "ellis", "harrison", "gibson",
+    "mcdonald", "marshall", "ortega", "freeman",
+    "wells", "webb", "simpson", "stevens", "tucker", "porter", "hunter",
+    "hicks", "crawford", "henry", "boyd", "mason", "moreno", "kennedy",
+    "warren", "dixon", "burns", "gordon", "shaw",
+    "holmes", "rice", "robertson", "hunt", "black", "daniels", "palmer",
+    "mills", "nichols", "grant", "knight", "ferguson", "rose", "stone",
+    "hawkins", "dunn", "perkins", "hudson", "spencer", "gardner", "stephens",
+    "payne", "pierce", "berry", "matthews", "arnold", "wagner", "willis",
+    "ray", "watkins", "olson", "carroll", "duncan", "snyder", "hart",
+    "cunningham", "bradley", "lane", "andrews", "harper", "fox",
+    "riley", "armstrong", "austin", "pope",
+})
+
+
+def is_common_surname(last_name: str) -> bool:
+    """Return True if last_name is in the top-300 US Census surnames."""
+    return last_name.strip().lower() in _COMMON_SURNAMES

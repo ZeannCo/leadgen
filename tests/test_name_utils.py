@@ -1,0 +1,136 @@
+from __future__ import annotations
+
+import pytest
+from services.name_utils import (
+    format_display_name,
+    is_common_surname,
+    parse_name,
+    split_tenants,
+)
+
+
+class TestParseName:
+    def test_last_comma_first(self):
+        assert parse_name("JOHNSON, MARY") == ("MARY", "JOHNSON")
+
+    def test_last_comma_first_middle(self):
+        # Middle name stripped
+        assert parse_name("JOHNSON, MARY ANN") == ("MARY", "JOHNSON")
+
+    def test_last_comma_first_initial(self):
+        # Middle initial stripped
+        assert parse_name("LILLY, BRETT L") == ("BRETT", "LILLY")
+
+    def test_last_comma_first_initial_dot(self):
+        assert parse_name("LILLY, BRETT L.") == ("BRETT", "LILLY")
+
+    def test_first_last(self):
+        assert parse_name("JOHN SMITH") == ("JOHN", "SMITH")
+
+    def test_first_middle_last(self):
+        # Middle name stripped
+        assert parse_name("BRETT L LILLY") == ("BRETT", "LILLY")
+
+    def test_first_middle_initial_dot_last(self):
+        assert parse_name("BRETT L. LILLY") == ("BRETT", "LILLY")
+
+    def test_single_token(self):
+        assert parse_name("JOHN") == ("", "")
+
+    def test_empty_string(self):
+        assert parse_name("") == ("", "")
+
+    def test_whitespace_only(self):
+        assert parse_name("   ") == ("", "")
+
+    def test_lowercase_preserved(self):
+        # parse_name does not uppercase — callers handle casing
+        first, last = parse_name("john smith")
+        assert first == "john"
+        assert last == "smith"
+
+
+class TestSplitTenants:
+    def test_single_person(self):
+        assert split_tenants("JOHN SMITH") == ["JOHN SMITH"]
+
+    def test_three_tokens_not_split(self):
+        # Could be first+middle+last — not split
+        assert split_tenants("BRETT L LILLY") == ["BRETT L LILLY"]
+
+    def test_four_tokens_split(self):
+        assert split_tenants("AVONTE THOMAS ASHANTE JOHNSON") == [
+            "AVONTE THOMAS",
+            "ASHANTE JOHNSON",
+        ]
+
+    def test_four_tokens_with_initial_not_split(self):
+        # Token[1] is a single char (middle initial) → treat as single person
+        assert split_tenants("JOHN A SMITH DOE") == ["JOHN A SMITH DOE"]
+
+    def test_empty_string(self):
+        assert split_tenants("") == [""]
+
+
+class TestIsCommonSurname:
+    def test_smith_is_common(self):
+        assert is_common_surname("smith") is True
+
+    def test_uppercase_smith_is_common(self):
+        assert is_common_surname("SMITH") is True
+
+    def test_johnson_is_common(self):
+        assert is_common_surname("JOHNSON") is True
+
+    def test_uncommon_surname(self):
+        assert is_common_surname("kowalczyk") is False
+
+    def test_empty_string(self):
+        assert is_common_surname("") is False
+
+
+# ── generational suffix stripping ─────────────────────────────────────────
+
+def test_parse_name_suffix_ii():
+    assert parse_name("KENT ANTHONY MCNEAL II") == ("KENT", "MCNEAL")
+
+def test_parse_name_suffix_jr():
+    assert parse_name("ROBERT SMITH JR") == ("ROBERT", "SMITH")
+
+def test_parse_name_suffix_sr():
+    assert parse_name("JAMES BROWN SR.") == ("JAMES", "BROWN")
+
+def test_parse_name_suffix_iii():
+    assert parse_name("WILLIAM DUPREE III") == ("WILLIAM", "DUPREE")
+
+def test_parse_name_suffix_iv():
+    assert parse_name("CHARLES LILLY IV") == ("CHARLES", "LILLY")
+
+def test_parse_name_no_suffix_unchanged():
+    assert parse_name("KENT MCNEAL") == ("KENT", "MCNEAL")
+
+def test_parse_name_comma_suffix_ignored():
+    assert parse_name("MCNEAL, KENT II") == ("KENT", "MCNEAL")
+
+
+class TestFormatDisplayName:
+    def test_last_comma_first_to_first_last(self):
+        assert format_display_name("ZAPATA, JONATHAN") == "Jonathan Zapata"
+
+    def test_mixed_case_last_comma_first(self):
+        assert format_display_name("Balderson, William") == "William Balderson"
+
+    def test_already_first_last_unchanged_order(self):
+        assert format_display_name("Turgay Saltu") == "Turgay Saltu"
+
+    def test_all_caps_first_last(self):
+        assert format_display_name("JESUS MENENDEZ") == "Jesus Menendez"
+
+    def test_none_passthrough(self):
+        assert format_display_name(None) is None
+
+    def test_empty_string_passthrough(self):
+        assert format_display_name("") == ""
+
+    def test_single_token_falls_back_unchanged(self):
+        assert format_display_name("Cher") == "Cher"

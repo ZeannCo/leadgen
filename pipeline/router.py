@@ -1,0 +1,23 @@
+from models.contact import EnrichedContact, RoutingOutcome
+from pipeline.qualification import rent_threshold_for_state
+
+
+def route_ec(contact: EnrichedContact) -> RoutingOutcome:
+    """Owner Services contacts the landlord."""
+    property_type = (contact.property_type or "").strip().lower()
+    if property_type in {"commercial", "retail", "office"}:
+        return RoutingOutcome(action="proceed", tag="Commercial", pipeline="commercial")
+    if (
+        contact.estimated_rent is not None
+        and contact.estimated_rent < rent_threshold_for_state(contact.filing.state)
+    ):
+        return RoutingOutcome(action="skip", tag="Below-Threshold")
+    return RoutingOutcome(action="proceed", tag="EC-New-Filing", pipeline="residential")
+
+
+def route_ng(contact: EnrichedContact) -> RoutingOutcome:
+    """Resident Services contacts the tenant."""
+    property_type = (contact.property_type or "").strip().lower()
+    if property_type in {"commercial", "retail", "office"}:
+        return RoutingOutcome(action="proceed", tag="NG-New-Filing", pipeline="commercial")
+    return RoutingOutcome(action="proceed", tag="NG-New-Filing", pipeline="residential")
